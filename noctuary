@@ -18,11 +18,72 @@ initializeCli();
 
 
 // ============== CONFIGURATION ==============
-define('SCRIPT_VERSION', '1.0.0');
-define('DB_FILE', __DIR__ . '/dream_journal.sqlite');
+define('SCRIPT_VERSION', '1.1.0');
 define('LUCIDITY_THRESHOLD', 5);
 define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=');
 
+/**
+ * Gets the appropriate user-specific configuration directory based on the OS.
+ * @return string The path to the configuration directory.
+ */
+function getConfigDir(): string {
+    if (PHP_OS_FAMILY === 'Windows') {
+        return getenv('APPDATA') . '/Noctuary';
+    }
+
+    $xdgConfigHome = getenv('XDG_CONFIG_HOME');
+    if (!empty($xdgConfigHome)) {
+        return $xdgConfigHome . '/noctuary';
+    }
+
+    return getenv('HOME') . '/.config/noctuary';
+}
+
+/**
+ * Gets the appropriate user-specific data directory based on the OS.
+ * @return string The path to the data directory.
+ */
+function getDataDir(): string {
+    if (PHP_OS_FAMILY === 'Windows') {
+        return getenv('LOCALAPPDATA') . '/Noctuary';
+    }
+
+    $xdgDataHome = getenv('XDG_DATA_HOME');
+    if (!empty($xdgDataHome)) {
+        return $xdgDataHome . '/noctuary';
+    }
+
+    return getenv('HOME') . '/.local/share/noctuary';
+}
+
+
+/**
+ * Gets configuration settings, creating the config file if it doesn't exist.
+ * @return array The parsed configuration settings.
+ */
+function getConfiguration(): array {
+    $configDir = getConfigDir();
+    $configFile = $configDir . '/config.ini';
+
+    if (!is_dir($configDir)) {
+        mkdir($configDir, 0700, true);
+    }
+
+    if (!file_exists($configFile)) {
+        echo Color::YELLOW . "First run: Creating default configuration file at: {$configFile}" . Color::RESET . "\n";
+        $dataDir = getDataDir();
+        $defaultDbPath = $dataDir . '/dream_journal.sqlite';
+
+        $defaultConfig = "[paths]\n";
+        $defaultConfig .= "db_path = \"{$defaultDbPath}\"\n\n";
+        $defaultConfig .= "[api_keys]\n";
+        $defaultConfig .= "gemini_api_key = \"\"\n";
+
+        file_put_contents($configFile, $defaultConfig);
+    }
+
+    return parse_ini_file($configFile, false, INI_SCANNER_TYPED);
+}
 
 // ============== ANSI COLOR CODES FOR CLI ==============
 class Color {
@@ -41,13 +102,38 @@ class Color {
 // ============== DATABASE INITIALIZATION AND CONNECTION ==============
 
 /**
+ * Gets the configured path for the database file.
+ * @return string The full path to the database file.
+ */
+function getDbPath(): string {
+    $config = getConfiguration();
+    $dbPath = $config['db_path'] ?? null;
+
+    if (!$dbPath) {
+        echo Color::RED . "Database path is not defined in the configuration file." . Color::RESET . "\n";
+        exit(1);
+    }
+
+    // Ensure the directory for the database exists
+    $dbDir = dirname($dbPath);
+    if (!is_dir($dbDir)) {
+        mkdir($dbDir, 0700, true);
+    }
+
+    return $dbPath;
+}
+
+
+/**
  * Gets a PDO database connection and initializes the DB if it doesn't exist.
  * @return PDO
  */
 function getDbConnection(): PDO {
-    $isNewDb = !file_exists(DB_FILE);
+    $dbFile = getDbPath();
+    $isNewDb = !file_exists($dbFile);
+
     try {
-        $pdo = new PDO('sqlite:' . DB_FILE);
+        $pdo = new PDO('sqlite:' . $dbFile);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
     } catch (PDOException $e) {
@@ -56,7 +142,7 @@ function getDbConnection(): PDO {
     }
 
     if ($isNewDb) {
-        echo Color::YELLOW . "First run detected. Creating database schema..." . Color::RESET . "\n";
+        echo Color::YELLOW . "Creating database schema in: {$dbFile}" . Color::RESET . "\n";
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS dreams (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +168,28 @@ function prompt(string $question): string {
     echo Color::BOLD . $question . Color::RESET . " ";
     return trim(fgets(STDIN));
 }
+
+/**
+ * Gets the Gemini API key, prioritizing the environment variable over the config file.
+ * @return string|null The API key or null if not found.
+ */
+function getApiKey(): ?string {
+    // Priority 1: Environment Variable
+    $apiKey = getenv('GEMINI_API_KEY');
+    if (!empty($apiKey)) {
+        return $apiKey;
+    }
+
+    // Priority 2: Configuration File
+    $config = getConfiguration();
+    $apiKey = $config['gemini_api_key'] ?? null;
+    if (!empty($apiKey)) {
+        return $apiKey;
+    }
+
+    return null;
+}
+
 
 /**
  * Gets multi-line input from the user by launching their preferred text editor.
@@ -149,19 +257,21 @@ function showLucidityScale(): void {
  * @return string|null The response text from the API, or null on failure.
  */
 function callGeminiApi(string $prompt, string $errorContext = 'API'): ?string {
-    $apiKey = getenv('GEMINI_API_KEY');
+    $apiKey = getApiKey();
     if (empty($apiKey)) {
-        echo Color::RED . "Error: GEMINI_API_KEY environment variable not set." . Color::RESET . "\n";
+        echo Color::RED . "Error: Gemini API key not set. Please set the GEMINI_API_KEY environment variable or add it to your config file." . Color::RESET . "\n";
         return null;
     }
 
     $requestBody = ['contents' => [['parts' => [['text' => $prompt]]]]];
+
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, GEMINI_API_URL . $apiKey);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
     curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+
     $response = curl_exec($ch);
 
     if (curl_errno($ch)) {
@@ -169,6 +279,7 @@ function callGeminiApi(string $prompt, string $errorContext = 'API'): ?string {
         curl_close($ch);
         return null;
     }
+
     curl_close($ch);
 
     $responseData = json_decode($response, true);
@@ -234,7 +345,6 @@ function displayDreamList(array $dreams, string $title): void {
     echo "------------------------------------------------------------------------\n";
     printf("%-5s %-20s %-35s %s\n", "ID", "Date & Time", "Title", "Lucidity");
     echo "------------------------------------------------------------------------\n";
-
     foreach ($dreams as $dream) {
         $scoreColor = getColorForLucidity($dream['lucidity_score']);
         $title = mb_strimwidth($dream['title'], 0, 33, "...");
@@ -328,7 +438,6 @@ function addDream(?string $date = null, bool $autoTag = false): void {
         "INSERT INTO dreams (date, title, description, lucidity_score, tags, created_at) 
          VALUES (:date, :title, :description, :lucidity_score, :tags, :created_at)"
     );
-
     $stmt->execute([
         ':date'           => $date,
         ':title'          => $title,
@@ -379,6 +488,7 @@ function editDream(int $id): void {
         echo Color::YELLOW . "Invalid time format. Keeping original time if present." . Color::RESET . "\n";
         if (!empty($currentTime)) $date = "{$date} {$currentTime}";
     }
+
 
     echo Color::BOLD . "\nEditing description. The current text will be loaded into your editor." . Color::RESET . "\n";
     $description = getEditorInput($dream['description']);
@@ -459,7 +569,6 @@ function addOrEditUserAnalysis(int $id): void {
 
     echo Color::CYAN . Color::BOLD . "--- Reflecting on Dream #{$id}: '{$dream['title']}' ---" . Color::RESET . "\n";
     echo Color::BOLD . "Editing your personal analysis. The current text will be loaded into your editor." . Color::RESET . "\n";
-
     $newAnalysis = getEditorInput($dream['user_analysis'] ?? '');
 
     $updateStmt = $pdo->prepare("UPDATE dreams SET user_analysis = ? WHERE id = ?");
@@ -493,9 +602,7 @@ function analyzeDream(int $id): void {
     }
 
     echo Color::CYAN . "Analyzing dream #{$id}: '{$dream['title']}'..." . Color::RESET . "\n";
-
     $prompt = "You are a dream analysis assistant. Your purpose is to interpret dreams based on common archetypes, symbolism, and psychological principles. Do not give medical or life advice. Provide a concise, insightful analysis of the following dream. Focus on potential themes, emotional undercurrents, and possible connections to waking life concerns. The dream is:\n\n---\n\n{$dream['description']}";
-
     $analysisText = callGeminiApi($prompt, 'Dream Analysis');
 
     if ($analysisText) {
@@ -536,7 +643,6 @@ function analyzeTrends(array $args = []): void {
 
     echo Color::CYAN . "Analyzing " . count($descriptions) . " dreams {$rangeDescription} for recurring themes and signs..." . Color::RESET . "\n";
     $dreamCorpus = implode("\n\n---\n\n", $descriptions);
-
     $prompt = "You are a dream analyst expert at identifying patterns. Analyze the following collection of " . count($descriptions) . " dreams from a user's journal. Your task is to identify and list the top 5-7 recurring themes, symbols, scenarios, or emotions (these are 'dreamsigns').
 
 For each identified theme, provide:
@@ -549,7 +655,6 @@ Format the output clearly and make it easy to read.
 Here are the dreams:
 ---
 {$dreamCorpus}";
-
     $analysisText = callGeminiApi($prompt, 'Trend Analysis');
 
     if ($analysisText) {
@@ -577,7 +682,6 @@ function generateMantra(): void {
 
     echo Color::CYAN . "Generating a MILD mantra based on your dream from " . Color::BOLD . $dream['date'] . Color::RESET . Color::CYAN . ": '{$dream['title']}'..." . Color::RESET . "\n\n";
     $dreamContext = "Title: {$dream['title']}\nDescription: {$dream['description']}\nTags: {$dream['tags']}";
-
     $prompt = "You are a lucid dreaming assistant. Your task is to generate a personalized MILD (Mnemonic Induction of Lucid Dreams) mantra based on a user's recent non-lucid dream.
 
 The mantra must be:
@@ -700,6 +804,7 @@ function showStats(): void {
     printf("  %-28s %.2f / 10\n", "Average Lucidity Score:", $avgLucidity);
     printf("  %-28s %.1f%%\n", "Lucid Dream Rate:", $lucidRate);
 
+
     $tagsStmt = $pdo->query("SELECT tags FROM dreams WHERE tags != '' AND tags IS NOT NULL");
     $allTags = [];
     while ($row = $tagsStmt->fetch()) {
@@ -758,7 +863,7 @@ function showHelp(): void {
     echo Color::CYAN . "  mantra" . Color::RESET . "                             - Generate a MILD mantra from your last non-lucid dream.\n";
     echo Color::GREEN . "  help" . Color::RESET . "                               - Display this help message.\n";
     echo Color::GREEN . "  version" . Color::RESET . "                            - Display the script version.\n\n";
-    echo Color::DIM . "Note: AI commands require the GEMINI_API_KEY environment variable." . Color::RESET . "\n";
+    echo Color::DIM . "Note: AI commands require the GEMINI_API_KEY to be set in your environment or config file." . Color::RESET . "\n";
 }
 
 
@@ -833,8 +938,6 @@ switch ($command) {
         generateMantra();
         break;
 
-
-
     case 'view':
         if (!isset($argv[2]) || !ctype_digit($argv[2])) {
             echo Color::RED . "Error: You must provide a numeric dream ID to view." . Color::RESET . "\n";
@@ -858,7 +961,7 @@ switch ($command) {
     case 'help':
         showHelp();
         break;
-        
+
     case 'version':
     case '--version':
     case '-v':
