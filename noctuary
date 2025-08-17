@@ -1,0 +1,874 @@
+#!/usr/bin/env php
+<?php
+
+// ============== SCRIPT INITIALIZATION ==============
+
+/**
+ * Performs initial setup for the CLI environment.
+ * On Windows, this attempts to enable ANSI color support in the console.
+ */
+function initializeCli(): void {
+    // This is primarily for Windows 10+ and PHP 7.2+
+    if (PHP_OS_FAMILY === 'Windows' && function_exists('sapi_windows_vt100_support')) {
+        sapi_windows_vt100_support(STDOUT, true);
+    }
+}
+
+initializeCli();
+
+
+// ============== CONFIGURATION ==============
+define('SCRIPT_VERSION', '1.0.0');
+define('DB_FILE', __DIR__ . '/dream_journal.sqlite');
+define('LUCIDITY_THRESHOLD', 5);
+define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=');
+
+
+// ============== ANSI COLOR CODES FOR CLI ==============
+class Color {
+    public const BOLD = "\033[1m";
+    public const DIM = "\033[2m";
+    public const GREEN = "\033[32m";
+    public const YELLOW = "\033[33m";
+    public const BLUE = "\033[34m";
+    public const MAGENTA = "\033[35m";
+    public const CYAN = "\033[36m";
+    public const RED = "\033[31m";
+    public const RESET = "\033[0m";
+}
+
+
+// ============== DATABASE INITIALIZATION AND CONNECTION ==============
+
+/**
+ * Gets a PDO database connection and initializes the DB if it doesn't exist.
+ * @return PDO
+ */
+function getDbConnection(): PDO {
+    $isNewDb = !file_exists(DB_FILE);
+    try {
+        $pdo = new PDO('sqlite:' . DB_FILE);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        echo Color::RED . "Database Error: " . $e->getMessage() . Color::RESET . "\n";
+        exit(1);
+    }
+
+    if ($isNewDb) {
+        echo Color::YELLOW . "First run detected. Creating database schema..." . Color::RESET . "\n";
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS dreams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                lucidity_score INTEGER NOT NULL CHECK(lucidity_score >= 0 AND lucidity_score <= 10),
+                tags TEXT,
+                user_analysis TEXT NULL,
+                analysis TEXT NULL,
+                created_at TEXT NOT NULL
+            )
+        ");
+        echo Color::GREEN . "Database initialized successfully." . Color::RESET . "\n\n";
+    }
+
+    return $pdo;
+}
+
+// ============== HELPER FUNCTIONS ==============
+
+function prompt(string $question): string {
+    echo Color::BOLD . $question . Color::RESET . " ";
+    return trim(fgets(STDIN));
+}
+
+/**
+ * Gets multi-line input from the user by launching their preferred text editor.
+ * This function is cross-platform, supporting Windows, macOS, and Linux.
+ *
+ * @param string $initialContent The content to pre-populate the editor with.
+ * @return string The content saved by the user.
+ */
+function getEditorInput(string $initialContent = ''): string {
+    // 1. Determine the default editor in a cross-platform way.
+    $editor = getenv('EDITOR');
+    if (!$editor) {
+        $editor = getenv('VISUAL');
+    }
+    if (!$editor) {
+        // If no standard environment variable is set, choose a sensible default.
+        if (PHP_OS_FAMILY === 'Windows') {
+            $editor = 'notepad';
+        } else {
+            $editor = 'vi';
+        }
+    }
+
+    // 2. Create a temporary file to work with.
+    $tmpfile = tempnam(sys_get_temp_dir(), 'dream_');
+    if ($tmpfile === false) {
+        echo Color::RED . "Error: Could not create a temporary file." . Color::RESET . "\n";
+        // Fallback to avoid losing data, though it's a poor editing experience.
+        return $initialContent;
+    }
+    file_put_contents($tmpfile, $initialContent);
+
+    echo Color::YELLOW . "Launching '{$editor}'... Save and close the file to continue." . Color::RESET . "\n";
+
+    // 3. Launch the editor. The `system` call is blocking and will wait for it to close.
+    system("{$editor} " . escapeshellarg($tmpfile));
+
+    $content = file_get_contents($tmpfile);
+    unlink($tmpfile);
+    return trim($content);
+}
+
+function getColorForLucidity(int $score): string {
+    if ($score >= 8) return Color::MAGENTA;
+    if ($score >= 5) return Color::CYAN;
+    if ($score >= 1) return Color::YELLOW;
+    return Color::DIM;
+}
+
+function showLucidityScale(): void {
+    echo Color::DIM . "--------------------------------------------------\n";
+    echo "Lucidity Score Guide:\n";
+    echo "  0-2: Non-lucid or vague awareness.\n";
+    echo "  3-4: Questioned reality, but lost awareness.\n";
+    echo "  5-7: Became lucid with moderate control/clarity.\n";
+    echo "  8-10: High lucidity, vivid, strong control.\n";
+    echo "--------------------------------------------------" . Color::RESET . "\n";
+}
+
+/**
+ * A centralized function to call the Gemini API.
+ *
+ * @param string $prompt The prompt to send to the API.
+ * @param string $errorContext A string to use in error messages.
+ * @return string|null The response text from the API, or null on failure.
+ */
+function callGeminiApi(string $prompt, string $errorContext = 'API'): ?string {
+    $apiKey = getenv('GEMINI_API_KEY');
+    if (empty($apiKey)) {
+        echo Color::RED . "Error: GEMINI_API_KEY environment variable not set." . Color::RESET . "\n";
+        return null;
+    }
+
+    $requestBody = ['contents' => [['parts' => [['text' => $prompt]]]]];
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, GEMINI_API_URL . $apiKey);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    $response = curl_exec($ch);
+
+    if (curl_errno($ch)) {
+        echo Color::RED . "Curl error during {$errorContext}: " . curl_error($ch) . Color::RESET . "\n";
+        curl_close($ch);
+        return null;
+    }
+    curl_close($ch);
+
+    $responseData = json_decode($response, true);
+    $text = $responseData['candidates'][0]['content']['parts'][0]['text'] ?? null;
+
+    if ($text === null) {
+        echo Color::RED . "Failed to get a valid response from the {$errorContext}." . Color::RESET . "\n";
+        echo "API Response: " . $response . "\n";
+        return null;
+    }
+
+    return trim($text);
+}
+
+/**
+ * Parses command-line arguments to create a SQL WHERE clause for date filtering.
+ * @param array $args The arguments array.
+ * @param string $defaultRange The default range description if no args are provided.
+ * @param string $defaultWhere The default WHERE clause if no args are provided.
+ * @return array An associative array with 'where', 'params', and 'description'.
+ */
+function parseDateRangeArgs(array $args, string $defaultWhere, string $defaultRange): array {
+    $whereClause = $defaultWhere;
+    $params = [];
+    $rangeDescription = $defaultRange;
+
+    if (count($args) === 2) {
+        $whereClause = "WHERE date(date) BETWEEN ? AND ?";
+        $params = [$args[0], $args[1]];
+        $rangeDescription = "from {$args[0]} to {$args[1]}";
+    } elseif (count($args) === 1) {
+        $arg = $args[0];
+        if (preg_match('/^(\d+)d$/', $arg, $matches)) {
+            $days = $matches[1];
+            $startDate = date('Y-m-d', strtotime("-{$days} days"));
+            $whereClause = "WHERE date(date) >= ?";
+            $params[] = $startDate;
+            $rangeDescription = "in the last {$days} days";
+        } elseif (preg_match('/^\d{4}-\d{2}-\d{2}$/', $arg)) {
+            $whereClause = "WHERE date(date) = ?";
+            $params[] = $arg;
+            $rangeDescription = "on {$arg}";
+        } elseif (preg_match('/^\d{4}-\d{2}$/', $arg)) {
+            $whereClause = "WHERE strftime('%Y-%m', date) = ?";
+            $params[] = $arg;
+            $rangeDescription = "in month {$arg}";
+        } elseif (preg_match('/^\d{4}$/', $arg)) {
+            $whereClause = "WHERE strftime('%Y', date) = ?";
+            $params[] = $arg;
+            $rangeDescription = "in year {$arg}";
+        }
+    }
+    return ['where' => $whereClause, 'params' => $params, 'description' => $rangeDescription];
+}
+
+/**
+ * Displays a formatted list of dreams in a table.
+ * @param array $dreams The array of dream records to display.
+ * @param string $title The title to display above the list.
+ */
+function displayDreamList(array $dreams, string $title): void {
+    echo Color::BLUE . Color::BOLD . "--- {$title} ---" . Color::RESET . "\n";
+    echo "------------------------------------------------------------------------\n";
+    printf("%-5s %-20s %-35s %s\n", "ID", "Date & Time", "Title", "Lucidity");
+    echo "------------------------------------------------------------------------\n";
+
+    foreach ($dreams as $dream) {
+        $scoreColor = getColorForLucidity($dream['lucidity_score']);
+        $title = mb_strimwidth($dream['title'], 0, 33, "...");
+        printf(
+            "%-5d %-20s %-35s " . $scoreColor . "%s" . Color::RESET . "\n",
+            $dream['id'],
+            $dream['date'],
+            $title,
+            "[" . str_pad($dream['lucidity_score'], 2, ' ', STR_PAD_LEFT) . "/10]"
+        );
+    }
+    echo "------------------------------------------------------------------------\n";
+}
+
+
+// ============== CORE COMMAND FUNCTIONS ==============
+
+/**
+ * Gets AI-suggested tags for a dream description.
+ * @param string $description The text of the dream.
+ * @return string A comma-separated list of suggested tags.
+ */
+function getAiSuggestedTags(string $description): string {
+    if (empty(trim($description))) {
+        return ''; // Don't call the API for an empty dream
+    }
+
+    echo Color::DIM . "Asking AI for tag suggestions..." . Color::RESET . "\n";
+
+    $prompt = "You are an expert at analyzing text to extract key themes. Analyze the following dream description and generate a concise, comma-separated list of 5-7 relevant tags. The tags should be lowercase. Do not provide any explanation, headings, or text other than the tag list itself.
+
+Example: If the dream is about flying over a vast, blue ocean, your output should be:
+flying, ocean, water, blue, sky, vastness
+
+Dream Description:
+---
+{$description}";
+
+    return callGeminiApi($prompt, 'Tag Suggestion') ?? '';
+}
+
+function addDream(?string $date = null, bool $autoTag = false): void {
+    if ($date === null) {
+        $date = date('Y-m-d');
+    }
+
+    echo Color::CYAN . Color::BOLD . "--- Add New Dream Entry for date: {$date} ---" . Color::RESET . "\n";
+
+    $title = prompt("Enter a title for the dream (optional):");
+    if (empty($title)) {
+        $title = "Untitled Dream on {$date}";
+    }
+
+    echo Color::BOLD . "Enter the full dream description using your default editor:" . Color::RESET . "\n";
+    $description = getEditorInput();
+
+    $time = prompt("Enter time of dream (HH:MM, 24-hour format, optional):");
+    if (!empty($time) && preg_match('/^([01]\d|2[0-3]):([0-5]\d)$/', $time)) {
+        $date = "{$date} {$time}"; // Combine date and time
+    } elseif (!empty($time)) {
+        echo Color::YELLOW . "Invalid time format. Time will not be saved." . Color::RESET . "\n";
+    }
+
+    showLucidityScale();
+    $lucidity_score = -1;
+    while ($lucidity_score < 0 || $lucidity_score > 10) {
+        $input = prompt("Enter lucidity score (0-10):");
+        if (is_numeric($input) && $input >= 0 && $input <= 10) {
+            $lucidity_score = (int)$input;
+        } else {
+            echo Color::RED . "Invalid score. Please enter a number between 0 and 10." . Color::RESET . "\n";
+        }
+    }
+
+    $suggestedTags = '';
+    if ($autoTag) {
+        $suggestedTags = getAiSuggestedTags($description);
+    }
+
+    $tags = '';
+    if (!empty($suggestedTags)) {
+        echo "\n" . Color::CYAN . "AI Suggested Tags: " . Color::YELLOW . $suggestedTags . Color::RESET . "\n";
+        $userInput = prompt("Enter tags (Press Enter to accept suggestions):");
+        $tags = ($userInput === '') ? $suggestedTags : $userInput;
+    } else {
+        $tags = prompt("Enter tags (comma-separated):");
+    }
+
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare(
+        "INSERT INTO dreams (date, title, description, lucidity_score, tags, created_at) 
+         VALUES (:date, :title, :description, :lucidity_score, :tags, :created_at)"
+    );
+
+    $stmt->execute([
+        ':date'           => $date,
+        ':title'          => $title,
+        ':description'    => $description,
+        ':lucidity_score' => $lucidity_score,
+        ':tags'           => $tags,
+        ':created_at'     => date('Y-m-d H:i:s')
+    ]);
+
+    $lastId = $pdo->lastInsertId();
+    echo Color::GREEN . "\nDream journal entry #{$lastId} added successfully!" . Color::RESET . "\n";
+}
+
+function editDream(int $id): void {
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT * FROM dreams WHERE id = ?");
+    $stmt->execute([$id]);
+    $dream = $stmt->fetch();
+
+    if (!$dream) {
+        echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
+        return;
+    }
+
+    echo Color::CYAN . Color::BOLD . "--- Editing Dream Entry #{$id} ---" . Color::RESET . "\n";
+
+    $newTitle = prompt("Title [{$dream['title']}]:");
+    $title = !empty($newTitle) ? $newTitle : $dream['title'];
+
+    $dateParts = explode(' ', $dream['date']);
+    $currentDate = $dateParts[0];
+    $currentTime = $dateParts[1] ?? '';
+
+    $newDateInput = prompt("Date (YYYY-MM-DD) [{$currentDate}]:");
+    if (!empty($newDateInput) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $newDateInput)) {
+        $date = $newDateInput;
+    } else {
+        $date = $currentDate;
+        if (!empty($newDateInput)) echo Color::YELLOW . "Invalid date format. Keeping original." . Color::RESET . "\n";
+    }
+
+    $newTimeInput = prompt("Time (HH:MM) [{$currentTime}]:");
+    if (!empty($newTimeInput) && preg_match('/^([01]\d|2[0-3]):([0-5]\d)$/', $newTimeInput)) {
+        $date = "{$date} {$newTimeInput}";
+    } elseif ($newTimeInput === '' && !empty($currentTime)) {
+        $date = "{$date} {$currentTime}";
+    } elseif (!empty($newTimeInput)) {
+        echo Color::YELLOW . "Invalid time format. Keeping original time if present." . Color::RESET . "\n";
+        if (!empty($currentTime)) $date = "{$date} {$currentTime}";
+    }
+
+    echo Color::BOLD . "\nEditing description. The current text will be loaded into your editor." . Color::RESET . "\n";
+    $description = getEditorInput($dream['description']);
+
+    $newScoreInput = prompt("Lucidity Score (0-10) [{$dream['lucidity_score']}]:");
+    if ($newScoreInput !== '' && is_numeric($newScoreInput) && $newScoreInput >= 0 && $newScoreInput <= 10) {
+        $lucidity_score = (int)$newScoreInput;
+    } else {
+        $lucidity_score = $dream['lucidity_score'];
+        if ($newScoreInput !== '') echo Color::YELLOW . "Invalid score. Keeping original." . Color::RESET . "\n";
+    }
+
+    $newTags = prompt("Tags [{$dream['tags']}]:");
+    $tags = ($newTags !== '') ? $newTags : $dream['tags'];
+
+    $user_analysis = $dream['user_analysis'];
+    $confirmAnalysisEdit = prompt("\nEdit your personal analysis? [y/N]:");
+    if (strtolower($confirmAnalysisEdit) === 'y') {
+        echo Color::BOLD . "Editing your analysis. The current text will be loaded into your editor." . Color::RESET . "\n";
+        $user_analysis = getEditorInput($dream['user_analysis']);
+    }
+
+    $updateStmt = $pdo->prepare(
+        "UPDATE dreams SET title = :title, date = :date, description = :description, 
+         lucidity_score = :lucidity_score, tags = :tags, user_analysis = :user_analysis
+         WHERE id = :id"
+    );
+    $updateStmt->execute([
+        ':title' => $title,
+        ':date' => $date,
+        ':description' => $description,
+        ':lucidity_score' => $lucidity_score,
+        ':tags' => $tags,
+        ':user_analysis' => $user_analysis,
+        ':id' => $id
+    ]);
+
+    echo Color::GREEN . "\nDream entry #{$id} updated successfully!" . Color::RESET . "\n";
+}
+
+function deleteDream(int $id): void {
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT title, date FROM dreams WHERE id = ?");
+    $stmt->execute([$id]);
+    $dream = $stmt->fetch();
+
+    if (!$dream) {
+        echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
+        return;
+    }
+
+    echo Color::RED . Color::BOLD . "You are about to delete the following entry:" . Color::RESET . "\n";
+    echo "  ID: {$id}\n";
+    echo "  Date: {$dream['date']}\n";
+    echo "  Title: {$dream['title']}\n\n";
+
+    $confirmation = prompt("Are you sure you want to permanently delete this entry? [y/N]:");
+
+    if (strtolower($confirmation) === 'y') {
+        $deleteStmt = $pdo->prepare("DELETE FROM dreams WHERE id = ?");
+        $deleteStmt->execute([$id]);
+        echo Color::GREEN . "Dream entry #{$id} has been deleted." . Color::RESET . "\n";
+    } else {
+        echo Color::YELLOW . "Deletion cancelled." . Color::RESET . "\n";
+    }
+}
+
+function addOrEditUserAnalysis(int $id): void {
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT title, user_analysis FROM dreams WHERE id = ?");
+    $stmt->execute([$id]);
+    $dream = $stmt->fetch();
+
+    if (!$dream) {
+        echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
+        return;
+    }
+
+    echo Color::CYAN . Color::BOLD . "--- Reflecting on Dream #{$id}: '{$dream['title']}' ---" . Color::RESET . "\n";
+    echo Color::BOLD . "Editing your personal analysis. The current text will be loaded into your editor." . Color::RESET . "\n";
+
+    $newAnalysis = getEditorInput($dream['user_analysis'] ?? '');
+
+    $updateStmt = $pdo->prepare("UPDATE dreams SET user_analysis = ? WHERE id = ?");
+    $updateStmt->execute([$newAnalysis, $id]);
+
+    echo Color::GREEN . "\nYour analysis for dream #{$id} has been saved." . Color::RESET . "\n";
+}
+
+function analyzeDream(int $id): void {
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT title, description, analysis FROM dreams WHERE id = ?");
+    $stmt->execute([$id]);
+    $dream = $stmt->fetch();
+
+    if (!$dream) {
+        echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
+        return;
+    }
+
+    if (empty(trim($dream['description']))) {
+        echo Color::YELLOW . "Cannot analyze a dream with an empty description." . Color::RESET . "\n";
+        return;
+    }
+
+    if (!empty($dream['analysis'])) {
+        $confirm = prompt(Color::YELLOW . "This dream has already been analyzed. Overwrite? [y/N]:" . Color::RESET);
+        if (strtolower($confirm) !== 'y') {
+            echo "Analysis cancelled.\n";
+            return;
+        }
+    }
+
+    echo Color::CYAN . "Analyzing dream #{$id}: '{$dream['title']}'..." . Color::RESET . "\n";
+
+    $prompt = "You are a dream analysis assistant. Your purpose is to interpret dreams based on common archetypes, symbolism, and psychological principles. Do not give medical or life advice. Provide a concise, insightful analysis of the following dream. Focus on potential themes, emotional undercurrents, and possible connections to waking life concerns. The dream is:\n\n---\n\n{$dream['description']}";
+
+    $analysisText = callGeminiApi($prompt, 'Dream Analysis');
+
+    if ($analysisText) {
+        $updateStmt = $pdo->prepare("UPDATE dreams SET analysis = ? WHERE id = ?");
+        $updateStmt->execute([$analysisText, $id]);
+
+        echo Color::GREEN . "Analysis complete and saved." . Color::RESET . "\n";
+        echo Color::MAGENTA . "\n--- Gemini Analysis ---\n" . Color::RESET;
+        echo wordwrap($analysisText, 70) . "\n";
+    }
+}
+
+function analyzeTrends(array $args = []): void {
+    $dateRange = parseDateRangeArgs(
+        $args,
+        "WHERE date(date) >= date('now', '-30 days')",
+        "in the last 30 days"
+    );
+    $whereClause = $dateRange['where'];
+    $params = $dateRange['params'];
+    $rangeDescription = $dateRange['description'];
+
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT description FROM dreams {$whereClause}");
+    $stmt->execute($params);
+    $descriptions = $stmt->fetchAll(PDO::FETCH_COLUMN, 0);
+
+    if (count($descriptions) < 3) {
+        echo Color::YELLOW . "Found " . count($descriptions) . " dreams {$rangeDescription}. A minimum of 3 is recommended for a meaningful trend analysis." . Color::RESET . "\n";
+        if (count($descriptions) === 0) return;
+
+        $confirm = prompt(Color::YELLOW . "Continue anyway? [y/N]:" . Color::RESET);
+        if (strtolower($confirm) !== 'y') {
+            echo "Trend analysis cancelled.\n";
+            return;
+        }
+    }
+
+    echo Color::CYAN . "Analyzing " . count($descriptions) . " dreams {$rangeDescription} for recurring themes and signs..." . Color::RESET . "\n";
+    $dreamCorpus = implode("\n\n---\n\n", $descriptions);
+
+    $prompt = "You are a dream analyst expert at identifying patterns. Analyze the following collection of " . count($descriptions) . " dreams from a user's journal. Your task is to identify and list the top 5-7 recurring themes, symbols, scenarios, or emotions (these are 'dreamsigns').
+
+For each identified theme, provide:
+1. A clear title for the theme (e.g., \"Theme: Being Chased\").
+2. A concise interpretation of what this recurring element might signify in the dreamer's waking life.
+3. Suggest a reality check the dreamer could perform if they encounter this theme again (e.g., \"Reality Check: If you feel chased, try to look at your hands.\").
+
+Format the output clearly and make it easy to read.
+
+Here are the dreams:
+---
+{$dreamCorpus}";
+
+    $analysisText = callGeminiApi($prompt, 'Trend Analysis');
+
+    if ($analysisText) {
+        echo Color::MAGENTA . "\n--- Recurring Themes & Dream Sign Analysis ---\n" . Color::RESET;
+        echo wordwrap($analysisText, 70) . "\n";
+    }
+}
+
+function generateMantra(): void {
+    $pdo = getDbConnection();
+    // Find the most recent dream that is NOT lucid
+    $stmt = $pdo->prepare(
+        "SELECT id, title, description, tags, date FROM dreams
+         WHERE lucidity_score < ?
+         ORDER BY date DESC, id DESC LIMIT 1"
+    );
+    $stmt->execute([LUCIDITY_THRESHOLD]);
+    $dream = $stmt->fetch();
+
+    if (!$dream) {
+        echo Color::YELLOW . "No non-lucid dreams found to generate a mantra from." . Color::RESET . "\n";
+        echo "A non-lucid dream is any dream with a score below " . LUCIDITY_THRESHOLD . ".\n";
+        return;
+    }
+
+    echo Color::CYAN . "Generating a MILD mantra based on your dream from " . Color::BOLD . $dream['date'] . Color::RESET . Color::CYAN . ": '{$dream['title']}'..." . Color::RESET . "\n\n";
+    $dreamContext = "Title: {$dream['title']}\nDescription: {$dream['description']}\nTags: {$dream['tags']}";
+
+    $prompt = "You are a lucid dreaming assistant. Your task is to generate a personalized MILD (Mnemonic Induction of Lucid Dreams) mantra based on a user's recent non-lucid dream.
+
+The mantra must be:
+- A short, memorable, first-person phrase.
+- Directly related to a key theme, action, or 'dreamsign' from the provided dream.
+- Formulated as a positive intention to recognize the dream state in the future.
+- Example: If the dream was about flying, a good mantra would be \"Next time I'm flying, I will know I am dreaming.\"
+
+Here is the user's dream:
+---
+{$dreamContext}
+---
+
+Generate one personalized MILD mantra based on this dream. Output only the mantra itself, without any extra explanation, quotation marks, or surrounding text.";
+
+    $mantraText = callGeminiApi($prompt, 'Mantra Generation');
+
+    if ($mantraText) {
+        echo Color::MAGENTA . "--- Your Personalized MILD Mantra ---" . Color::RESET . "\n";
+        echo Color::BOLD . Color::YELLOW . "\n  " . trim($mantraText) . "\n\n" . Color::RESET;
+        echo Color::DIM . "Repeat this phrase to yourself as you fall asleep to set your intention to become lucid." . Color::RESET . "\n";
+    }
+}
+
+function listDreams(array $args = []): void {
+    $dateRange = parseDateRangeArgs(
+        $args,
+        "WHERE strftime('%Y-%m', date) = strftime('%Y-%m', 'now')",
+        "in the current month (" . date('Y-m') . ")"
+    );
+    $whereClause = $dateRange['where'];
+    $params = $dateRange['params'];
+    $rangeDescription = $dateRange['description'];
+
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT id, date, title, lucidity_score FROM dreams {$whereClause} ORDER BY date DESC, id DESC");
+    $stmt->execute($params);
+    $dreams = $stmt->fetchAll();
+
+    if (empty($dreams)) {
+        echo Color::YELLOW . "No dreams found {$rangeDescription}." . Color::RESET . "\n";
+        return;
+    }
+
+    displayDreamList($dreams, "Dream Entries {$rangeDescription}");
+}
+
+function viewDream(int $id): void {
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("SELECT * FROM dreams WHERE id = ?");
+    $stmt->execute([$id]);
+    $dream = $stmt->fetch();
+
+    if (!$dream) {
+        echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
+        return;
+    }
+
+    $scoreColor = getColorForLucidity($dream['lucidity_score']);
+    echo Color::CYAN . "========================================================\n";
+    echo Color::BOLD . "Dream Entry #{$dream['id']}\n" . Color::RESET;
+    echo Color::CYAN . "========================================================\n";
+    echo Color::BOLD . "Title:        " . Color::RESET . $dream['title'] . "\n";
+    echo Color::BOLD . "Date & Time:  " . Color::RESET . $dream['date'] . "\n";
+    echo Color::BOLD . "Lucidity:     " . $scoreColor . "{$dream['lucidity_score']}/10" . Color::RESET . "\n";
+    echo Color::BOLD . "Tags:         " . Color::RESET . ($dream['tags'] ?: 'None') . "\n";
+    echo Color::DIM . "--------------------------------------------------------\n" . Color::RESET;
+    echo Color::BOLD . "Description:\n" . Color::RESET . wordwrap($dream['description'], 70) . "\n";
+
+    if (!empty($dream['user_analysis'])) {
+        echo Color::DIM . "--------------------------------------------------------\n" . Color::RESET;
+        echo Color::BOLD . "Your Analysis:\n" . Color::RESET;
+        echo wordwrap($dream['user_analysis'], 70) . "\n";
+    }
+
+    if (!empty($dream['analysis'])) {
+        echo Color::MAGENTA . "\n--- Gemini Analysis ---\n" . Color::RESET;
+        echo wordwrap($dream['analysis'], 70) . "\n";
+    }
+
+    echo Color::CYAN . "========================================================\n" . Color::RESET;
+}
+
+function searchDreams(string $keyword): void {
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare(
+        "SELECT id, date, title, lucidity_score FROM dreams
+         WHERE title LIKE :keyword OR description LIKE :keyword OR tags LIKE :keyword
+         ORDER BY date DESC"
+    );
+    $stmt->execute([':keyword' => "%{$keyword}%"]);
+    $dreams = $stmt->fetchAll();
+
+    if (empty($dreams)) {
+        echo Color::YELLOW . "No dreams found matching '{$keyword}'." . Color::RESET . "\n";
+        return;
+    }
+
+    displayDreamList($dreams, "Search Results for '{$keyword}'");
+}
+
+function showStats(): void {
+    $pdo = getDbConnection();
+    echo Color::MAGENTA . Color::BOLD . "--- Dream Journal Analysis ---" . Color::RESET . "\n";
+
+    $totalDreams = $pdo->query("SELECT COUNT(*) FROM dreams")->fetchColumn();
+    if ($totalDreams == 0) {
+        echo Color::YELLOW . "Not enough data to generate stats. Add some dreams first." . Color::RESET . "\n";
+        return;
+    }
+
+    $lucidDreams = $pdo->query("SELECT COUNT(*) FROM dreams WHERE lucidity_score >= " . LUCIDITY_THRESHOLD)->fetchColumn();
+    $avgLucidity = $pdo->query("SELECT AVG(lucidity_score) FROM dreams")->fetchColumn();
+    $lucidRate = ($totalDreams > 0) ? ($lucidDreams / $totalDreams) * 100 : 0;
+    $lucidLabel = sprintf("Lucid Dreams (Score %d+):", LUCIDITY_THRESHOLD);
+
+    echo Color::CYAN . "\nOverall Stats:\n" . Color::RESET;
+    printf("  %-28s %d\n", "Total Dreams Recorded:", $totalDreams);
+    printf("  %-28s %d\n", $lucidLabel, $lucidDreams);
+    printf("  %-28s %.2f / 10\n", "Average Lucidity Score:", $avgLucidity);
+    printf("  %-28s %.1f%%\n", "Lucid Dream Rate:", $lucidRate);
+
+    $tagsStmt = $pdo->query("SELECT tags FROM dreams WHERE tags != '' AND tags IS NOT NULL");
+    $allTags = [];
+    while ($row = $tagsStmt->fetch()) {
+        $tags = explode(',', $row['tags']);
+        foreach ($tags as $tag) {
+            $trimmedTag = trim(strtolower($tag));
+            if ($trimmedTag) {
+                $allTags[] = $trimmedTag;
+            }
+        }
+    }
+
+    if (!empty($allTags)) {
+        echo Color::CYAN . "\nTop 5 Most Common Tags:\n" . Color::RESET;
+        $tagCounts = array_count_values($allTags);
+        arsort($tagCounts);
+        $topTags = array_slice($tagCounts, 0, 5, true);
+        foreach ($topTags as $tag => $count) {
+            printf("  %-25s %d times\n", "'" . ucfirst($tag) . "'", $count);
+        }
+    }
+
+    $monthlyStmt = $pdo->query(
+        "SELECT strftime('%Y-%m', date) as month, COUNT(*) as count 
+         FROM dreams
+         WHERE date >= date('now', '-12 months')
+         GROUP BY month
+         ORDER BY month DESC"
+    );
+    $monthlyData = $monthlyStmt->fetchAll();
+
+    if (!empty($monthlyData)) {
+        echo Color::CYAN . "\nDream Frequency (Last 12 Months):\n" . Color::RESET;
+        foreach ($monthlyData as $month) {
+            printf("  %s : %s %d dreams\n", $month['month'], str_repeat('=', $month['count']), $month['count']);
+        }
+    }
+}
+
+function showHelp(): void {
+    echo Color::BOLD . "The Noctuary - A CLI Dream Journal (v" . SCRIPT_VERSION . ")" . Color::RESET . "\n";
+    echo "A tool for tracking and analyzing your dreams, with a focus on lucidity.\n\n";
+    echo Color::BOLD . Color::YELLOW . "Usage:" . Color::RESET . "\n";
+    echo "  noctuary <command> [options]\n\n";
+    echo Color::BOLD . Color::YELLOW . "Available Commands:" . Color::RESET . "\n";
+    echo Color::GREEN . "  add [--date YYYY-MM-DD] [--auto-tag]" . Color::RESET . " - Add a new dream entry.\n";
+    echo Color::GREEN . "  edit <id>" . Color::RESET . "                          - Edit an existing dream entry.\n";
+    echo Color::GREEN . "  delete <id>" . Color::RESET . "                        - Delete a dream entry.\n";
+    echo Color::GREEN . "  list [range]" . Color::RESET . "                       - Show a list of dreams (e.g., 7d, 2025-08).\n";
+    echo Color::GREEN . "  view <id>" . Color::RESET . "                          - Display the full details and analysis of a dream.\n";
+    echo Color::GREEN . "  reflect <id>" . Color::RESET . "                       - Add or edit your personal analysis of a dream.\n";
+    echo Color::GREEN . "  search <keyword>" . Color::RESET . "                   - Search dream titles, descriptions, and tags.\n";
+    echo Color::GREEN . "  stats" . Color::RESET . "                              - Show enhanced statistics about your dreams.\n";
+    echo Color::CYAN . "  analyze <id>" . Color::RESET . "                       - Analyze a single dream with the Gemini API.\n";
+    echo Color::CYAN . "  trends [range]" . Color::RESET . "                     - Analyze recurring themes across dreams (default: 30d).\n";
+    echo Color::CYAN . "  mantra" . Color::RESET . "                             - Generate a MILD mantra from your last non-lucid dream.\n";
+    echo Color::GREEN . "  help" . Color::RESET . "                               - Display this help message.\n";
+    echo Color::GREEN . "  version" . Color::RESET . "                            - Display the script version.\n\n";
+    echo Color::DIM . "Note: AI commands require the GEMINI_API_KEY environment variable." . Color::RESET . "\n";
+}
+
+
+// ============== MAIN SCRIPT ROUTER ==============
+
+$argv = $_SERVER['argv'];
+$command = $argv[1] ?? 'help';
+
+switch ($command) {
+    case 'add':
+        $date = null;
+        $autoTag = false;
+        $args = array_slice($argv, 2); // Get all arguments after the command
+
+        foreach ($args as $i => $arg) {
+            if ($arg === '--date') {
+                $dateValue = $args[$i + 1] ?? null;
+                if ($dateValue && preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateValue)) {
+                    $date = $dateValue;
+                } else {
+                    echo Color::RED . "Error: --date flag requires a valid date in YYYY-MM-DD format." . Color::RESET . "\n";
+                    exit(1);
+                }
+            } elseif ($arg === '--auto-tag') {
+                $autoTag = true;
+            }
+        }
+        addDream($date, $autoTag);
+        break;
+
+    case 'list':
+        listDreams(array_slice($argv, 2));
+        break;
+
+    case 'edit':
+        if (!isset($argv[2]) || !ctype_digit($argv[2])) {
+            echo Color::RED . "Error: You must provide a numeric dream ID to edit." . Color::RESET . "\n";
+        } else {
+            editDream((int)$argv[2]);
+        }
+        break;
+
+    case 'delete':
+        if (!isset($argv[2]) || !ctype_digit($argv[2])) {
+            echo Color::RED . "Error: You must provide a numeric dream ID to delete." . Color::RESET . "\n";
+        } else {
+            deleteDream((int)$argv[2]);
+        }
+        break;
+        
+    case 'reflect':
+        if (!isset($argv[2]) || !ctype_digit($argv[2])) {
+            echo Color::RED . "Error: You must provide a numeric dream ID to reflect on." . Color::RESET . "\n";
+        } else {
+            addOrEditUserAnalysis((int)$argv[2]);
+        }
+        break;
+
+    case 'analyze':
+        if (!isset($argv[2]) || !ctype_digit($argv[2])) {
+            echo Color::RED . "Error: You must provide a numeric dream ID to analyze." . Color::RESET . "\n";
+        } else {
+            analyzeDream((int)$argv[2]);
+        }
+        break;
+
+    case 'trends':
+        analyzeTrends(array_slice($argv, 2));
+        break;
+
+    case 'mantra':
+        generateMantra();
+        break;
+
+
+
+    case 'view':
+        if (!isset($argv[2]) || !ctype_digit($argv[2])) {
+            echo Color::RED . "Error: You must provide a numeric dream ID to view." . Color::RESET . "\n";
+        } else {
+            viewDream((int)$argv[2]);
+        }
+        break;
+
+    case 'search':
+        if (!isset($argv[2])) {
+            echo Color::RED . "Error: You must provide a keyword to search for." . Color::RESET . "\n";
+        } else {
+            searchDreams($argv[2]);
+        }
+        break;
+
+    case 'stats':
+        showStats();
+        break;
+
+    case 'help':
+        showHelp();
+        break;
+        
+    case 'version':
+    case '--version':
+    case '-v':
+        echo "The Noctuary - A CLI Dream Journal version " . Color::BOLD . SCRIPT_VERSION . Color::RESET . "\n";
+        break;
+
+    default:
+        echo Color::RED . "Unknown command: '{$command}'" . Color::RESET . "\n\n";
+        showHelp();
+        exit(1);
+}
+
+exit(0);
