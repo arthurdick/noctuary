@@ -16,9 +16,30 @@ function initializeCli(): void {
 
 initializeCli();
 
+/**
+ * Checks for required PHP extensions and exits if they are missing.
+ */
+function checkDependencies(): void
+{
+    $missingExtensions = [];
+    if (!extension_loaded('sqlite3')) {
+        $missingExtensions[] = 'php-sqlite3';
+    }
+    if (!extension_loaded('curl')) {
+        $missingExtensions[] = 'php-curl';
+    }
+
+    if (!empty($missingExtensions)) {
+        echo Color::RED . "Error: Missing required PHP extensions: " . implode(', ', $missingExtensions) . Color::RESET . "\n";
+        echo Color::YELLOW . "Please install them to continue." . Color::RESET . "\n";
+        exit(1);
+    }
+}
+
+checkDependencies();
 
 // ============== CONFIGURATION ==============
-define('SCRIPT_VERSION', '1.1.0');
+define('SCRIPT_VERSION', '1.1.1');
 define('LUCIDITY_THRESHOLD', 5);
 define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=');
 
