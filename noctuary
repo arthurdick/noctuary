@@ -4,6 +4,12 @@
 // ============== SCRIPT INITIALIZATION ==============
 
 /**
+ * Set the internal character encoding to UTF-8 for all multibyte string operations.
+ * This is crucial for correctly handling international characters.
+ */
+mb_internal_encoding('UTF-8');
+
+/**
  * Performs initial setup for the CLI environment.
  * On Windows, this attempts to enable ANSI color support in the console.
  */
@@ -17,6 +23,45 @@ function initializeCli(): void {
 initializeCli();
 
 /**
+ * Gets the terminal width in a cross-platform way.
+ * @return int The width of the terminal in columns.
+ */
+function getTerminalWidth(): int
+{
+    // Default width if detection fails
+    $defaultWidth = 80;
+
+    if (PHP_OS_FAMILY === 'Windows') {
+        $output = [];
+        // The '@' suppresses errors if exec is disabled
+        @exec('mode con', $output);
+        foreach ($output as $line) {
+            if (preg_match('/^\s*Columns:\s*(\d+)\s*$/', $line, $matches)) {
+                return (int)$matches[1];
+            }
+        }
+        return $defaultWidth;
+    }
+
+    // For Linux, macOS, and other Unix-like systems, try 'tput' first.
+    $width = @shell_exec('tput cols');
+    if ($width !== null && is_numeric(trim($width))) {
+        return (int)trim($width);
+    }
+
+    // Fallback to 'stty size' if 'tput' is not available.
+    $width = @shell_exec('stty size');
+    if ($width !== null) {
+        $parts = explode(' ', trim($width));
+        if (isset($parts[1]) && is_numeric($parts[1])) {
+            return (int)$parts[1];
+        }
+    }
+
+    return $defaultWidth;
+}
+
+/**
  * Checks for required PHP extensions and exits if they are missing.
  */
 function checkDependencies(): void
@@ -28,6 +73,10 @@ function checkDependencies(): void
     if (!extension_loaded('curl')) {
         $missingExtensions[] = 'php-curl';
     }
+    if (!extension_loaded('mbstring')) {
+        $missingExtensions[] = 'php-mbstring';
+    }
+
 
     if (!empty($missingExtensions)) {
         echo Color::RED . "Error: Missing required PHP extensions: " . implode(', ', $missingExtensions) . Color::RESET . "\n";
@@ -39,7 +88,8 @@ function checkDependencies(): void
 checkDependencies();
 
 // ============== CONFIGURATION ==============
-define('SCRIPT_VERSION', '1.1.1');
+define('SCRIPT_VERSION', '1.2.0');
+define('TERMINAL_WIDTH', getTerminalWidth());
 define('LUCIDITY_THRESHOLD', 5);
 define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=');
 
@@ -94,7 +144,6 @@ function getConfiguration(): array {
         echo Color::YELLOW . "First run: Creating default configuration file at: {$configFile}" . Color::RESET . "\n";
         $dataDir = getDataDir();
         $defaultDbPath = $dataDir . '/dream_journal.sqlite';
-
         $defaultConfig = "[paths]\n";
         $defaultConfig .= "db_path = \"{$defaultDbPath}\"\n\n";
         $defaultConfig .= "[api_keys]\n";
@@ -106,10 +155,15 @@ function getConfiguration(): array {
     return parse_ini_file($configFile, false, INI_SCANNER_TYPED);
 }
 
-// ============== ANSI COLOR CODES FOR CLI ==============
-class Color {
+// ============== ANSI CODES FOR CLI ==============
+class Ansi {
     public const BOLD = "\033[1m";
     public const DIM = "\033[2m";
+    public const ITALIC = "\033[3m";
+    public const RESET = "\033[0m";
+}
+
+class Color {
     public const GREEN = "\033[32m";
     public const YELLOW = "\033[33m";
     public const BLUE = "\033[34m";
@@ -152,7 +206,6 @@ function getDbPath(): string {
 function getDbConnection(): PDO {
     $dbFile = getDbPath();
     $isNewDb = !file_exists($dbFile);
-
     try {
         $pdo = new PDO('sqlite:' . $dbFile);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -185,8 +238,106 @@ function getDbConnection(): PDO {
 
 // ============== HELPER FUNCTIONS ==============
 
+/**
+ * A word-wrap function that is aware of ANSI escape codes and multibyte characters.
+ * @param string $string The input string.
+ * @param int $width The number of columns to wrap to.
+ * @param string $break The line-breaking character.
+ * @return string The wrapped string.
+ */
+function wordwrapAnsi(string $string, int $width = 75, string $break = "\n"): string
+{
+    $lines = explode($break, $string);
+    $wrappedLines = [];
+
+    foreach ($lines as $line) {
+        $currentLine = '';
+        $currentLineWidth = 0;
+        // This regex splits the string by spaces, but keeps the delimiter
+        $words = preg_split('/(\s+)/u', $line, -1, PREG_SPLIT_DELIM_CAPTURE);
+
+        foreach ($words as $word) {
+            // Strip ANSI codes to measure real length
+            $wordVisibleLength = mb_strlen(preg_replace('/\033\[[0-9;]*m/', '', $word));
+
+            if ($wordVisibleLength === 0 && trim($word) !== '') { // It's probably just an ANSI code
+                 $currentLine .= $word;
+                 continue;
+            }
+
+            if ($currentLineWidth + $wordVisibleLength > $width && $currentLineWidth > 0) {
+                $wrappedLines[] = rtrim($currentLine);
+                $currentLine = $word;
+                $currentLineWidth = $wordVisibleLength;
+            } else {
+                $currentLine .= $word;
+                $currentLineWidth += $wordVisibleLength;
+            }
+        }
+        $wrappedLines[] = rtrim($currentLine);
+    }
+
+    return implode($break, $wrappedLines);
+}
+
+/**
+ * A simple, dependency-free markdown parser for CLI display.
+ * This version is colorless and focuses on structure and style (bold/italic).
+ * @param string $text The markdown text to parse.
+ * @return string The formatted text with ANSI style codes.
+ */
+function parseMarkdown(string $text): string
+{
+    $lines = explode("\n", $text);
+    $in_list = false;
+
+    foreach ($lines as &$line) {
+        // Headings
+        if (preg_match('/^###\s+(.*)/u', $line, $matches)) {
+            $line = Ansi::BOLD . '### ' . trim($matches[1]) . Ansi::RESET;
+        } elseif (preg_match('/^##\s+(.*)/u', $line, $matches)) {
+            $line = Ansi::BOLD . '## ' . trim($matches[1]) . Ansi::RESET;
+        } elseif (preg_match('/^#\s+(.*)/u', $line, $matches)) {
+            $line = Ansi::BOLD . '# ' . trim($matches[1]) . Ansi::RESET;
+        }
+        // Unordered Lists
+        elseif (preg_match('/^[\*\-\+]\s+(.*)/u', $line, $matches)) {
+            $line = '  • ' . trim($matches[1]);
+            $in_list = true;
+        }
+        // Ordered Lists
+        elseif (preg_match('/^\d+\.\s+(.*)/u', $line, $matches)) {
+            preg_match('/^(\d+)\./u', $line, $num_matches);
+            $line = '  ' . $num_matches[1] . '. ' . trim($matches[1]);
+            $in_list = true;
+        }
+        // Blockquotes
+        elseif (preg_match('/^>\s?(.*)/u', $line, $matches)) {
+            $line = Ansi::DIM . '  | ' . trim($matches[1]) . Ansi::RESET;
+        } else {
+            if ($in_list && trim($line) === '') {
+                // Keep empty lines between list items
+                $line = '';
+            } elseif ($in_list) {
+                // continuation of a list item.
+                $line = '    ' . $line;
+            }
+            $in_list = (trim($line) !== '');
+        }
+
+        // Inline formatting
+        // Bold
+        $line = preg_replace('/(\*\*|__)(.*?)\1/u', Ansi::BOLD . '$2' . Ansi::RESET, $line);
+        // Italic
+        $line = preg_replace('/(\*|_)(.*?)\1/u', Ansi::ITALIC . '$2' . Ansi::RESET, $line);
+    }
+
+    return implode("\n", $lines);
+}
+
+
 function prompt(string $question): string {
-    echo Color::BOLD . $question . Color::RESET . " ";
+    echo Ansi::BOLD . $question . Ansi::RESET . " ";
     return trim(fgets(STDIN));
 }
 
@@ -242,9 +393,7 @@ function getEditorInput(string $initialContent = ''): string {
         return $initialContent;
     }
     file_put_contents($tmpfile, $initialContent);
-
     echo Color::YELLOW . "Launching '{$editor}'... Save and close the file to continue." . Color::RESET . "\n";
-
     // 3. Launch the editor. The `system` call is blocking and will wait for it to close.
     system("{$editor} " . escapeshellarg($tmpfile));
 
@@ -257,17 +406,17 @@ function getColorForLucidity(int $score): string {
     if ($score >= 8) return Color::MAGENTA;
     if ($score >= 5) return Color::CYAN;
     if ($score >= 1) return Color::YELLOW;
-    return Color::DIM;
+    return Ansi::DIM;
 }
 
 function showLucidityScale(): void {
-    echo Color::DIM . "--------------------------------------------------\n";
+    echo Ansi::DIM . "--------------------------------------------------\n";
     echo "Lucidity Score Guide:\n";
     echo "  0-2: Non-lucid or vague awareness.\n";
     echo "  3-4: Questioned reality, but lost awareness.\n";
     echo "  5-7: Became lucid with moderate control/clarity.\n";
     echo "  8-10: High lucidity, vivid, strong control.\n";
-    echo "--------------------------------------------------" . Color::RESET . "\n";
+    echo "--------------------------------------------------" . Ansi::RESET . "\n";
 }
 
 /**
@@ -285,7 +434,6 @@ function callGeminiApi(string $prompt, string $errorContext = 'API'): ?string {
     }
 
     $requestBody = ['contents' => [['parts' => [['text' => $prompt]]]]];
-
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, GEMINI_API_URL . $apiKey);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -302,7 +450,6 @@ function callGeminiApi(string $prompt, string $errorContext = 'API'): ?string {
     }
 
     curl_close($ch);
-
     $responseData = json_decode($response, true);
     $text = $responseData['candidates'][0]['content']['parts'][0]['text'] ?? null;
 
@@ -362,18 +509,18 @@ function parseDateRangeArgs(array $args, string $defaultWhere, string $defaultRa
  * @param string $title The title to display above the list.
  */
 function displayDreamList(array $dreams, string $title): void {
-    echo Color::BLUE . Color::BOLD . "--- {$title} ---" . Color::RESET . "\n";
+    echo Color::BLUE . Ansi::BOLD . "--- {$title} ---" . Ansi::RESET . "\n";
     echo "------------------------------------------------------------------------\n";
     printf("%-5s %-20s %-35s %s\n", "ID", "Date & Time", "Title", "Lucidity");
     echo "------------------------------------------------------------------------\n";
     foreach ($dreams as $dream) {
         $scoreColor = getColorForLucidity($dream['lucidity_score']);
-        $title = mb_strimwidth($dream['title'], 0, 33, "...");
+        $titleText = mb_strimwidth($dream['title'], 0, 33, "...");
         printf(
             "%-5d %-20s %-35s " . $scoreColor . "%s" . Color::RESET . "\n",
             $dream['id'],
             $dream['date'],
-            $title,
+            $titleText,
             "[" . str_pad($dream['lucidity_score'], 2, ' ', STR_PAD_LEFT) . "/10]"
         );
     }
@@ -393,7 +540,7 @@ function getAiSuggestedTags(string $description): string {
         return ''; // Don't call the API for an empty dream
     }
 
-    echo Color::DIM . "Asking AI for tag suggestions..." . Color::RESET . "\n";
+    echo Ansi::DIM . "Asking AI for tag suggestions..." . Ansi::RESET . "\n";
 
     $prompt = "You are an expert at analyzing text to extract key themes. Analyze the following dream description and generate a concise, comma-separated list of 5-7 relevant tags. The tags should be lowercase. Do not provide any explanation, headings, or text other than the tag list itself.
 
@@ -403,7 +550,6 @@ flying, ocean, water, blue, sky, vastness
 Dream Description:
 ---
 {$description}";
-
     return callGeminiApi($prompt, 'Tag Suggestion') ?? '';
 }
 
@@ -412,14 +558,14 @@ function addDream(?string $date = null, bool $autoTag = false): void {
         $date = date('Y-m-d');
     }
 
-    echo Color::CYAN . Color::BOLD . "--- Add New Dream Entry for date: {$date} ---" . Color::RESET . "\n";
+    echo Color::CYAN . Ansi::BOLD . "--- Add New Dream Entry for date: {$date} ---" . Color::RESET . "\n";
 
     $title = prompt("Enter a title for the dream (optional):");
     if (empty($title)) {
         $title = "Untitled Dream on {$date}";
     }
 
-    echo Color::BOLD . "Enter the full dream description using your default editor:" . Color::RESET . "\n";
+    echo Ansi::BOLD . "Enter the full dream description using your default editor:" . Color::RESET . "\n";
     $description = getEditorInput();
 
     $time = prompt("Enter time of dream (HH:MM, 24-hour format, optional):");
@@ -477,13 +623,12 @@ function editDream(int $id): void {
     $stmt = $pdo->prepare("SELECT * FROM dreams WHERE id = ?");
     $stmt->execute([$id]);
     $dream = $stmt->fetch();
-
     if (!$dream) {
         echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
         return;
     }
 
-    echo Color::CYAN . Color::BOLD . "--- Editing Dream Entry #{$id} ---" . Color::RESET . "\n";
+    echo Color::CYAN . Ansi::BOLD . "--- Editing Dream Entry #{$id} ---" . Color::RESET . "\n";
 
     $newTitle = prompt("Title [{$dream['title']}]:");
     $title = !empty($newTitle) ? $newTitle : $dream['title'];
@@ -491,7 +636,6 @@ function editDream(int $id): void {
     $dateParts = explode(' ', $dream['date']);
     $currentDate = $dateParts[0];
     $currentTime = $dateParts[1] ?? '';
-
     $newDateInput = prompt("Date (YYYY-MM-DD) [{$currentDate}]:");
     if (!empty($newDateInput) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $newDateInput)) {
         $date = $newDateInput;
@@ -511,7 +655,7 @@ function editDream(int $id): void {
     }
 
 
-    echo Color::BOLD . "\nEditing description. The current text will be loaded into your editor." . Color::RESET . "\n";
+    echo Ansi::BOLD . "\nEditing description. The current text will be loaded into your editor." . Ansi::RESET . "\n";
     $description = getEditorInput($dream['description']);
 
     $newScoreInput = prompt("Lucidity Score (0-10) [{$dream['lucidity_score']}]:");
@@ -527,8 +671,8 @@ function editDream(int $id): void {
 
     $user_analysis = $dream['user_analysis'];
     $confirmAnalysisEdit = prompt("\nEdit your personal analysis? [y/N]:");
-    if (strtolower($confirmAnalysisEdit) === 'y') {
-        echo Color::BOLD . "Editing your analysis. The current text will be loaded into your editor." . Color::RESET . "\n";
+    if (mb_strtolower($confirmAnalysisEdit) === 'y') {
+        echo Ansi::BOLD . "Editing your analysis. The current text will be loaded into your editor." . Ansi::RESET . "\n";
         $user_analysis = getEditorInput($dream['user_analysis']);
     }
 
@@ -546,7 +690,6 @@ function editDream(int $id): void {
         ':user_analysis' => $user_analysis,
         ':id' => $id
     ]);
-
     echo Color::GREEN . "\nDream entry #{$id} updated successfully!" . Color::RESET . "\n";
 }
 
@@ -555,20 +698,17 @@ function deleteDream(int $id): void {
     $stmt = $pdo->prepare("SELECT title, date FROM dreams WHERE id = ?");
     $stmt->execute([$id]);
     $dream = $stmt->fetch();
-
     if (!$dream) {
         echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
         return;
     }
 
-    echo Color::RED . Color::BOLD . "You are about to delete the following entry:" . Color::RESET . "\n";
+    echo Color::RED . Ansi::BOLD . "You are about to delete the following entry:" . Color::RESET . "\n";
     echo "  ID: {$id}\n";
     echo "  Date: {$dream['date']}\n";
     echo "  Title: {$dream['title']}\n\n";
-
     $confirmation = prompt("Are you sure you want to permanently delete this entry? [y/N]:");
-
-    if (strtolower($confirmation) === 'y') {
+    if (mb_strtolower($confirmation) === 'y') {
         $deleteStmt = $pdo->prepare("DELETE FROM dreams WHERE id = ?");
         $deleteStmt->execute([$id]);
         echo Color::GREEN . "Dream entry #{$id} has been deleted." . Color::RESET . "\n";
@@ -582,19 +722,17 @@ function addOrEditUserAnalysis(int $id): void {
     $stmt = $pdo->prepare("SELECT title, user_analysis FROM dreams WHERE id = ?");
     $stmt->execute([$id]);
     $dream = $stmt->fetch();
-
     if (!$dream) {
         echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
         return;
     }
 
-    echo Color::CYAN . Color::BOLD . "--- Reflecting on Dream #{$id}: '{$dream['title']}' ---" . Color::RESET . "\n";
-    echo Color::BOLD . "Editing your personal analysis. The current text will be loaded into your editor." . Color::RESET . "\n";
+    echo Color::CYAN . Ansi::BOLD . "--- Reflecting on Dream #{$id}: '{$dream['title']}' ---" . Color::RESET . "\n";
+    echo Ansi::BOLD . "Editing your personal analysis. The current text will be loaded into your editor." . Color::RESET . "\n";
     $newAnalysis = getEditorInput($dream['user_analysis'] ?? '');
 
     $updateStmt = $pdo->prepare("UPDATE dreams SET user_analysis = ? WHERE id = ?");
     $updateStmt->execute([$newAnalysis, $id]);
-
     echo Color::GREEN . "\nYour analysis for dream #{$id} has been saved." . Color::RESET . "\n";
 }
 
@@ -603,7 +741,6 @@ function analyzeDream(int $id): void {
     $stmt = $pdo->prepare("SELECT title, description, analysis FROM dreams WHERE id = ?");
     $stmt->execute([$id]);
     $dream = $stmt->fetch();
-
     if (!$dream) {
         echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
         return;
@@ -616,7 +753,7 @@ function analyzeDream(int $id): void {
 
     if (!empty($dream['analysis'])) {
         $confirm = prompt(Color::YELLOW . "This dream has already been analyzed. Overwrite? [y/N]:" . Color::RESET);
-        if (strtolower($confirm) !== 'y') {
+        if (mb_strtolower($confirm) !== 'y') {
             echo "Analysis cancelled.\n";
             return;
         }
@@ -632,7 +769,7 @@ function analyzeDream(int $id): void {
 
         echo Color::GREEN . "Analysis complete and saved." . Color::RESET . "\n";
         echo Color::MAGENTA . "\n--- Gemini Analysis ---\n" . Color::RESET;
-        echo wordwrap($analysisText, 70) . "\n";
+        echo wordwrapAnsi(parseMarkdown($analysisText), TERMINAL_WIDTH) . "\n";
     }
 }
 
@@ -656,7 +793,7 @@ function analyzeTrends(array $args = []): void {
         if (count($descriptions) === 0) return;
 
         $confirm = prompt(Color::YELLOW . "Continue anyway? [y/N]:" . Color::RESET);
-        if (strtolower($confirm) !== 'y') {
+        if (mb_strtolower($confirm) !== 'y') {
             echo "Trend analysis cancelled.\n";
             return;
         }
@@ -680,7 +817,7 @@ Here are the dreams:
 
     if ($analysisText) {
         echo Color::MAGENTA . "\n--- Recurring Themes & Dream Sign Analysis ---\n" . Color::RESET;
-        echo wordwrap($analysisText, 70) . "\n";
+        echo wordwrapAnsi(parseMarkdown($analysisText), TERMINAL_WIDTH) . "\n";
     }
 }
 
@@ -701,7 +838,7 @@ function generateMantra(): void {
         return;
     }
 
-    echo Color::CYAN . "Generating a MILD mantra based on your dream from " . Color::BOLD . $dream['date'] . Color::RESET . Color::CYAN . ": '{$dream['title']}'..." . Color::RESET . "\n\n";
+    echo Color::CYAN . "Generating a MILD mantra based on your dream from " . Ansi::BOLD . $dream['date'] . Color::RESET . Color::CYAN . ": '{$dream['title']}'..." . Color::RESET . "\n\n";
     $dreamContext = "Title: {$dream['title']}\nDescription: {$dream['description']}\nTags: {$dream['tags']}";
     $prompt = "You are a lucid dreaming assistant. Your task is to generate a personalized MILD (Mnemonic Induction of Lucid Dreams) mantra based on a user's recent non-lucid dream.
 
@@ -719,11 +856,10 @@ Here is the user's dream:
 Generate one personalized MILD mantra based on this dream. Output only the mantra itself, without any extra explanation, quotation marks, or surrounding text.";
 
     $mantraText = callGeminiApi($prompt, 'Mantra Generation');
-
     if ($mantraText) {
         echo Color::MAGENTA . "--- Your Personalized MILD Mantra ---" . Color::RESET . "\n";
-        echo Color::BOLD . Color::YELLOW . "\n  " . trim($mantraText) . "\n\n" . Color::RESET;
-        echo Color::DIM . "Repeat this phrase to yourself as you fall asleep to set your intention to become lucid." . Color::RESET . "\n";
+        echo Ansi::BOLD . Color::YELLOW . "\n  " . trim($mantraText) . "\n\n" . Color::RESET;
+        echo Ansi::DIM . "Repeat this phrase to yourself as you fall asleep to set your intention to become lucid." . Ansi::RESET . "\n";
     }
 }
 
@@ -741,7 +877,6 @@ function listDreams(array $args = []): void {
     $stmt = $pdo->prepare("SELECT id, date, title, lucidity_score FROM dreams {$whereClause} ORDER BY date DESC, id DESC");
     $stmt->execute($params);
     $dreams = $stmt->fetchAll();
-
     if (empty($dreams)) {
         echo Color::YELLOW . "No dreams found {$rangeDescription}." . Color::RESET . "\n";
         return;
@@ -755,35 +890,37 @@ function viewDream(int $id): void {
     $stmt = $pdo->prepare("SELECT * FROM dreams WHERE id = ?");
     $stmt->execute([$id]);
     $dream = $stmt->fetch();
-
     if (!$dream) {
         echo Color::RED . "Error: No dream found with ID {$id}." . Color::RESET . "\n";
         return;
     }
 
     $scoreColor = getColorForLucidity($dream['lucidity_score']);
-    echo Color::CYAN . "========================================================\n";
-    echo Color::BOLD . "Dream Entry #{$dream['id']}\n" . Color::RESET;
-    echo Color::CYAN . "========================================================\n";
-    echo Color::BOLD . "Title:        " . Color::RESET . $dream['title'] . "\n";
-    echo Color::BOLD . "Date & Time:  " . Color::RESET . $dream['date'] . "\n";
-    echo Color::BOLD . "Lucidity:     " . $scoreColor . "{$dream['lucidity_score']}/10" . Color::RESET . "\n";
-    echo Color::BOLD . "Tags:         " . Color::RESET . ($dream['tags'] ?: 'None') . "\n";
-    echo Color::DIM . "--------------------------------------------------------\n" . Color::RESET;
-    echo Color::BOLD . "Description:\n" . Color::RESET . wordwrap($dream['description'], 70) . "\n";
+    $divider = Color::CYAN . str_repeat("=", TERMINAL_WIDTH) . Color::RESET;
+    $lineDivider = Ansi::DIM . str_repeat("-", TERMINAL_WIDTH) . Ansi::RESET;
 
+
+    echo $divider . "\n";
+    echo Ansi::BOLD . "Dream Entry #{$dream['id']}\n" . Ansi::RESET;
+    echo $divider . "\n";
+    echo Ansi::BOLD . "Title:        " . Ansi::RESET . $dream['title'] . "\n";
+    echo Ansi::BOLD . "Date & Time:  " . Ansi::RESET . $dream['date'] . "\n";
+    echo Ansi::BOLD . "Lucidity:     " . $scoreColor . "{$dream['lucidity_score']}/10" . Ansi::RESET . "\n";
+    echo Ansi::BOLD . "Tags:         " . Ansi::RESET . ($dream['tags'] ?: 'None') . "\n";
+    echo $lineDivider . "\n";
+    echo Ansi::BOLD . "Description:\n" . Ansi::RESET . wordwrapAnsi(parseMarkdown($dream['description']), TERMINAL_WIDTH) . "\n";
     if (!empty($dream['user_analysis'])) {
-        echo Color::DIM . "--------------------------------------------------------\n" . Color::RESET;
-        echo Color::BOLD . "Your Analysis:\n" . Color::RESET;
-        echo wordwrap($dream['user_analysis'], 70) . "\n";
+        echo $lineDivider . "\n";
+        echo Ansi::BOLD . "Your Analysis:\n" . Ansi::RESET;
+        echo wordwrapAnsi(parseMarkdown($dream['user_analysis']), TERMINAL_WIDTH) . "\n";
     }
 
     if (!empty($dream['analysis'])) {
         echo Color::MAGENTA . "\n--- Gemini Analysis ---\n" . Color::RESET;
-        echo wordwrap($dream['analysis'], 70) . "\n";
+        echo wordwrapAnsi(parseMarkdown($dream['analysis']), TERMINAL_WIDTH) . "\n";
     }
 
-    echo Color::CYAN . "========================================================\n" . Color::RESET;
+    echo $divider . "\n";
 }
 
 function searchDreams(string $keyword): void {
@@ -804,9 +941,19 @@ function searchDreams(string $keyword): void {
     displayDreamList($dreams, "Search Results for '{$keyword}'");
 }
 
+/**
+ * A multibyte-safe version of ucfirst.
+ * @param string $string The input string.
+ * @return string
+ */
+function mb_ucfirst(string $string): string {
+    $firstChar = mb_strtoupper(mb_substr($string, 0, 1));
+    return $firstChar . mb_substr($string, 1);
+}
+
 function showStats(): void {
     $pdo = getDbConnection();
-    echo Color::MAGENTA . Color::BOLD . "--- Dream Journal Analysis ---" . Color::RESET . "\n";
+    echo Color::MAGENTA . Ansi::BOLD . "--- Dream Journal Analysis ---" . Color::RESET . "\n";
 
     $totalDreams = $pdo->query("SELECT COUNT(*) FROM dreams")->fetchColumn();
     if ($totalDreams == 0) {
@@ -824,14 +971,12 @@ function showStats(): void {
     printf("  %-28s %d\n", $lucidLabel, $lucidDreams);
     printf("  %-28s %.2f / 10\n", "Average Lucidity Score:", $avgLucidity);
     printf("  %-28s %.1f%%\n", "Lucid Dream Rate:", $lucidRate);
-
-
     $tagsStmt = $pdo->query("SELECT tags FROM dreams WHERE tags != '' AND tags IS NOT NULL");
     $allTags = [];
     while ($row = $tagsStmt->fetch()) {
         $tags = explode(',', $row['tags']);
         foreach ($tags as $tag) {
-            $trimmedTag = trim(strtolower($tag));
+            $trimmedTag = trim(mb_strtolower($tag));
             if ($trimmedTag) {
                 $allTags[] = $trimmedTag;
             }
@@ -844,7 +989,7 @@ function showStats(): void {
         arsort($tagCounts);
         $topTags = array_slice($tagCounts, 0, 5, true);
         foreach ($topTags as $tag => $count) {
-            printf("  %-25s %d times\n", "'" . ucfirst($tag) . "'", $count);
+            printf("  %-25s %d times\n", "'" . mb_ucfirst($tag) . "'", $count);
         }
     }
 
@@ -866,11 +1011,11 @@ function showStats(): void {
 }
 
 function showHelp(): void {
-    echo Color::BOLD . "The Noctuary - A CLI Dream Journal (v" . SCRIPT_VERSION . ")" . Color::RESET . "\n";
+    echo Ansi::BOLD . "The Noctuary - A CLI Dream Journal (v" . SCRIPT_VERSION . ")" . Ansi::RESET . "\n";
     echo "A tool for tracking and analyzing your dreams, with a focus on lucidity.\n\n";
-    echo Color::BOLD . Color::YELLOW . "Usage:" . Color::RESET . "\n";
+    echo Ansi::BOLD . Color::YELLOW . "Usage:" . Ansi::RESET . "\n";
     echo "  noctuary <command> [options]\n\n";
-    echo Color::BOLD . Color::YELLOW . "Available Commands:" . Color::RESET . "\n";
+    echo Ansi::BOLD . Color::YELLOW . "Available Commands:" . Ansi::RESET . "\n";
     echo Color::GREEN . "  add [--date YYYY-MM-DD] [--auto-tag]" . Color::RESET . " - Add a new dream entry.\n";
     echo Color::GREEN . "  edit <id>" . Color::RESET . "                          - Edit an existing dream entry.\n";
     echo Color::GREEN . "  delete <id>" . Color::RESET . "                        - Delete a dream entry.\n";
@@ -884,7 +1029,7 @@ function showHelp(): void {
     echo Color::CYAN . "  mantra" . Color::RESET . "                             - Generate a MILD mantra from your last non-lucid dream.\n";
     echo Color::GREEN . "  help" . Color::RESET . "                               - Display this help message.\n";
     echo Color::GREEN . "  version" . Color::RESET . "                            - Display the script version.\n\n";
-    echo Color::DIM . "Note: AI commands require the GEMINI_API_KEY to be set in your environment or config file." . Color::RESET . "\n";
+    echo Ansi::DIM . "Note: AI commands require the GEMINI_API_KEY to be set in your environment or config file." . Ansi::RESET . "\n";
 }
 
 
@@ -892,7 +1037,6 @@ function showHelp(): void {
 
 $argv = $_SERVER['argv'];
 $command = $argv[1] ?? 'help';
-
 switch ($command) {
     case 'add':
         $date = null;
@@ -914,11 +1058,9 @@ switch ($command) {
         }
         addDream($date, $autoTag);
         break;
-
     case 'list':
         listDreams(array_slice($argv, 2));
         break;
-
     case 'edit':
         if (!isset($argv[2]) || !ctype_digit($argv[2])) {
             echo Color::RED . "Error: You must provide a numeric dream ID to edit." . Color::RESET . "\n";
@@ -958,7 +1100,6 @@ switch ($command) {
     case 'mantra':
         generateMantra();
         break;
-
     case 'view':
         if (!isset($argv[2]) || !ctype_digit($argv[2])) {
             echo Color::RED . "Error: You must provide a numeric dream ID to view." . Color::RESET . "\n";
@@ -978,15 +1119,13 @@ switch ($command) {
     case 'stats':
         showStats();
         break;
-
     case 'help':
         showHelp();
         break;
-
     case 'version':
     case '--version':
     case '-v':
-        echo "The Noctuary - A CLI Dream Journal version " . Color::BOLD . SCRIPT_VERSION . Color::RESET . "\n";
+        echo "The Noctuary - A CLI Dream Journal version " . Ansi::BOLD . SCRIPT_VERSION . Ansi::RESET . "\n";
         break;
 
     default:

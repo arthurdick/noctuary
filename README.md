@@ -8,26 +8,27 @@ The name comes from the word **noctuary**, which is a journal or record of thing
 
 ## Features
 
--   **✍️ Full Journaling Suite:** `add`, `edit`, `view`, and `delete` your dream entries with ease.
--   **🤔 Personal Reflection:** Add and edit your own personal analysis for each dream with the `reflect` command, keeping your thoughts separate from the AI's interpretation.
--   **📝 Rich Content Entry:** Uses your system's default text editor (`vim`, `nano`, `notepad`, etc.) for writing detailed, multi-line dream descriptions and analyses.
--   **🔎 Powerful Search & Listing:** `list` dreams by flexible date ranges (`7d`, `2025-08`, `2025-08-16`) and `search` your entire journal by keyword.
--   **🧠 AI-Powered Analysis:**
-    -   **Dream Interpretation:** Get a detailed analysis of a single dream's themes and symbolism with the `analyze` command.
-    -   **Trend Spotting:** Discover recurring dreamsigns, symbols, and emotions across multiple dreams with the `trends` command.
-    -   **MILD Mantra Generation:** Automatically create a personalized MILD (Mnemonic Induction of Lucid Dreams) mantra based on your last non-lucid dream using the `mantra` command.
-    -   **Auto-Tagging:** Automatically suggest relevant tags for your dream when you add it.
--   **📊 Detailed Statistics:** The `stats` command provides an overview of your dream history, including total dreams, lucid dream rate, average lucidity, and your most common tags.
--   **💻 CLI Native:** Fast, keyboard-driven, and designed to live in your terminal. Features color-coded output for excellent readability.
--   **⚙️ Cross-Platform Configuration:** Manages its configuration and database through a simple `config.ini` file located in the appropriate user-specific directory on Windows, macOS, and Linux.
+  - **✍️ Full Journaling Suite:** `add`, `edit`, `view`, and `delete` your dream entries with ease.
+  - **✨ Enhanced CLI Readability:** Dream descriptions, reflections, and AI analyses are parsed from markdown into a clean, readable format. The output automatically wraps to your terminal's width, ensuring a perfect layout every time.
+  - **🤔 Personal Reflection:** Add and edit your own personal analysis for each dream with the `reflect` command, keeping your thoughts separate from the AI's interpretation.
+  - **📝 Rich Content Entry:** Uses your system's default text editor (`vim`, `nano`, `notepad`, etc.) for writing detailed, multi-line dream descriptions and analyses.
+  - **🔎 Powerful Search & Listing:** `list` dreams by flexible date ranges (`7d`, `2025-08`, `2025-08-16`) and `search` your entire journal by keyword.
+  - **🧠 AI-Powered Analysis:**
+      - **Dream Interpretation:** Get a detailed analysis of a single dream's themes and symbolism with the `analyze` command.
+      - **Trend Spotting:** Discover recurring dreamsigns, symbols, and emotions across multiple dreams with the `trends` command.
+      - **MILD Mantra Generation:** Automatically create a personalized MILD (Mnemonic Induction of Lucid Dreams) mantra based on your last non-lucid dream using the `mantra` command.
+      - **Auto-Tagging:** Automatically suggest relevant tags for your dream when you add it.
+  - **📊 Detailed Statistics:** The `stats` command provides an overview of your dream history, including total dreams, lucid dream rate, average lucidity, and your most common tags.
+  - **💻 CLI Native:** Fast, keyboard-driven, and designed to live in your terminal. Features color-coded output for excellent readability.
+  - **⚙️ Cross-Platform Configuration:** Manages its configuration and database through a simple `config.ini` file located in the appropriate user-specific directory on Windows, macOS, and Linux.
 
 ## Installation
 
 ### Prerequisites
 
--   PHP 8.0+
--   The `php-sqlite3` and `php-curl` extensions.
--   A Google Gemini API Key (for AI features.)
+  - PHP 8.0+
+  - The `php-sqlite3`, `php-curl`, and `php-mbstring` extensions.
+  - A Google Gemini API Key (for AI features.)
 
 ### Steps
 
@@ -35,7 +36,7 @@ The name comes from the word **noctuary**, which is a journal or record of thing
     Clone this project to your local machine.
 
     ```sh
-    git clone [https://github.com/arthurdick/noctuary](https://github.com/arthurdick/noctuary)
+    git clone https://github.com/arthurdick/noctuary
     cd noctuary
     ```
 
@@ -62,9 +63,9 @@ The Noctuary is configured via a simple `config.ini` file that is created automa
 
 ### Configuration File Location
 
--   **Linux:** `~/.config/noctuary/config.ini`
--   **macOS:** `~/.config/noctuary/config.ini`
--   **Windows:** `C:\Users\YourUser\AppData\Roaming\Noctuary\config.ini`
+  - **Linux:** `~/.config/noctuary/config.ini`
+  - **macOS:** `~/.config/noctuary/config.ini`
+  - **Windows:** `C:\Users\YourUser\AppData\Roaming\Noctuary\config.ini`
 
 ### Settings
 
@@ -76,7 +77,7 @@ db_path = "/path/to/your/user/.local/share/noctuary/dream_journal.sqlite"
 
 [api_keys]
 gemini_api_key = ""
-````
+```
 
 1.  **`db_path`**: The full path to your SQLite database file. You can change this to store your journal in a different location, such as a cloud-synced folder (e.g., Dropbox, Google Drive).
 2.  **`gemini_api_key`**: Your Google Gemini API key.
