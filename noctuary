@@ -88,10 +88,10 @@ function checkDependencies(): void
 checkDependencies();
 
 // ============== CONFIGURATION ==============
-define('SCRIPT_VERSION', '1.2.0');
+define('SCRIPT_VERSION', '1.3.0');
 define('TERMINAL_WIDTH', getTerminalWidth());
 define('LUCIDITY_THRESHOLD', 5);
-define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=');
+define('GEMINI_API_URL', 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=');
 
 /**
  * Gets the appropriate user-specific configuration directory based on the OS.
